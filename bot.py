@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VPS Manager Telegram Bot — ZIP deploy, systemd, monitoring, AI fix."""
+"""VPS Manager Telegram Bot — faqat inline tugmalar: ilovalar, fayl menejeri, systemd, monitoring, ZIP deploy, AI fix."""
 import asyncio, html, json, os, re, shutil, time, uuid, zipfile
 from pathlib import Path
 
@@ -8,8 +8,8 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.filters import CommandStart
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -26,6 +26,7 @@ TMP.mkdir(parents=True, exist_ok=True)
 BACKUPS = APPS / ".backups"
 TIMINGS = APPS / ".timings.json"
 STABLE_SECS = int(os.getenv("STABLE_SECS", "10"))  # yangilangandan keyin barqarorlik tekshiruvi
+MAX_UP = 20 * 1024 * 1024  # Bot API yuklab olish limiti
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -36,6 +37,10 @@ dp.include_router(r)
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_.@-]{1,60}$")
 PENDING: dict[str, dict] = {}  # AI takliflari
+INPUT: dict[int, dict] = {}    # user_id -> kutilayotgan kiritish (matn yoki fayl)
+REG: dict[str, tuple[str, str]] = {}  # qisqa id -> (ilova, nisbiy yo'l) (callback_data 64 bayt bilan cheklangan)
+REV: dict[tuple[str, str], str] = {}
+PAGE = 14
 
 
 # ───────────── yordamchilar ─────────────
@@ -57,6 +62,13 @@ def pre(text: str, limit=3500) -> str:
     return f"<pre>{html.escape(text)}</pre>"
 
 
+def pre_head(text: str, limit=3500) -> str:
+    text = text.strip() or "(bo'sh)"
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return f"<pre>{html.escape(text)}</pre>"
+
+
 def unit(name: str) -> str:
     return f"app-{name}.service"
 
@@ -71,6 +83,64 @@ def bar(p: float) -> str:
 
 
 def gb(x): return f"{x / 1024**3:.1f}G"
+
+
+def hsize(n: float) -> str:
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB":
+            return f"{n:.0f}{u}" if u == "B" else f"{n:.1f}{u}"
+        n /= 1024
+
+
+def norm(rel: str) -> str:
+    return "" if rel in (".", "") else rel
+
+
+def ref(app: str, rel: str) -> str:
+    rel = norm(rel)
+    k = REV.get((app, rel))
+    if not k:
+        if len(REG) > 20000: REG.clear(); REV.clear()
+        k = uuid.uuid4().hex[:8]
+        REG[k] = (app, rel); REV[(app, rel)] = k
+    return k
+
+
+def resolve(app: str, rel: str) -> tuple[Path, Path]:
+    root = (APPS / app).resolve()
+    t = (root / rel).resolve()
+    if t != root and root not in t.parents:
+        raise ValueError("Xavfli yo'l")
+    return root, t
+
+
+def Btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def kb1(*rows: tuple[str, str]):
+    b = InlineKeyboardBuilder()
+    for t, d in rows: b.row(Btn(t, d))
+    return b.as_markup()
+
+
+def cancel_kb(text="❌ Bekor qilish"): return kb1((text, "cx"))
+
+
+def fix_kb(n: str): return kb1(("🤖 AI fix", f"do:{n}:fix"), ("📦 Ilova", f"app:{n}"))
+
+
+async def show(c: CallbackQuery, text: str, kb=None):
+    try:
+        await c.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "not modified" in str(e): return
+        await c.message.answer(text, reply_markup=kb)
+
+
+async def stale(c: CallbackQuery):
+    await c.answer("Tugma eskirgan, qaytadan oching", show_alert=True)
+    await show(c, MENU_TEXT, main_kb())
 
 
 # ───────────── monitoring ─────────────
@@ -114,11 +184,11 @@ async def status_text() -> str:
 
 async def alert_loop():
     last: dict[str, float] = {}
-    async def alert(key, msg):
+    async def alert(key, msg, markup=None):
         if time.time() - last.get(key, 0) > 900:
             last[key] = time.time()
             for a in ADMINS:
-                try: await bot.send_message(a, msg)
+                try: await bot.send_message(a, msg, reply_markup=markup)
                 except Exception: pass
     while True:
         try:
@@ -129,158 +199,415 @@ async def alert_loop():
             for n in app_names():
                 c, out = await sh(f"systemctl is-failed {unit(n)}")
                 if out.strip() == "failed":
-                    await alert(f"app-{n}", f"❌ <b>{n}</b> ishdan chiqdi. /fix {n}")
+                    await alert(f"app-{n}", f"❌ <b>{n}</b> ishdan chiqdi.", markup=fix_kb(n))
         except Exception as e:
             print("alert error", e)
         await asyncio.sleep(55)
 
 
 # ───────────── menyu ─────────────
+MENU_TEXT = ("🖥 <b>VPS Manager</b>\n\nBarcha boshqaruv tugmalar orqali.\n"
+             "Yangi ilova qo'shish uchun ZIP fayl yuboring — avtomatik deploy qilinadi.")
+
+
 def main_kb():
     b = InlineKeyboardBuilder()
-    b.button(text="📊 Holat", callback_data="st")
-    b.button(text="📦 Ilovalar", callback_data="apps")
-    b.button(text="⚙️ Xizmatlar", callback_data="svcs")
-    b.button(text="🐳 Docker", callback_data="docker")
-    b.button(text="💾 Disk/Port", callback_data="disk")
+    for t, d in [("📊 Holat", "st"), ("📦 Ilovalar", "apps"), ("⚙️ Xizmatlar", "svcs"), ("🐳 Docker", "docker"),
+                 ("💾 Disk/Port", "disk"), ("🖥 Terminal", "term"), ("♻️ Reboot", "reboot")]:
+        b.button(text=t, callback_data=d)
     b.adjust(2)
     return b.as_markup()
 
 
+MENU_BTN = ("🏠 Menyu", "menu")
+
+
 @r.message(CommandStart())
 async def start(m: Message):
-    await m.answer(
-        "🖥 <b>VPS Manager</b>\n\n• ZIP fayl yuboring — avtomatik deploy\n"
-        "• /status — monitoring\n• /apps — ilovalar\n• /svc &lt;start|stop|restart|status&gt; &lt;nom&gt;\n"
-        "• /logs &lt;nom&gt; — loglar\n• /fix &lt;nom&gt; — AI bilan tuzatish\n• /update &lt;nom&gt; — ZIP bilan yangilash (xatoda avtomatik rollback)\n• /rollback &lt;nom&gt; — oldingi versiya\n• /sh &lt;buyruq&gt; — terminal\n"
-        "• /reboot — serverni qayta yuklash", reply_markup=main_kb())
+    INPUT.pop(m.from_user.id, None)
+    await m.answer(MENU_TEXT, reply_markup=main_kb())
 
 
-@r.message(Command("status"))
-async def cmd_status(m: Message): await m.answer(await status_text(), reply_markup=main_kb())
+@r.callback_query(F.data == "menu")
+async def cb_menu(c: CallbackQuery):
+    INPUT.pop(c.from_user.id, None)
+    await show(c, MENU_TEXT, main_kb()); await c.answer()
+
+
+@r.callback_query(F.data == "noop")
+async def cb_noop(c: CallbackQuery): await c.answer()
+
+
+@r.callback_query(F.data == "cx")
+async def cb_cancel(c: CallbackQuery):
+    st = INPUT.pop(c.from_user.id, None)
+    await show(c, "❌ Bekor qilindi.", kb1(("⬅️ Orqaga", st["back"] if st else "menu"), MENU_BTN)); await c.answer()
 
 
 @r.callback_query(F.data == "st")
 async def cb_status(c: CallbackQuery):
-    await c.message.edit_text(await status_text(), reply_markup=main_kb()); await c.answer()
+    await show(c, await status_text(), kb1(("🔄 Yangilash", "st"), MENU_BTN)); await c.answer()
 
 
 @r.callback_query(F.data == "disk")
 async def cb_disk(c: CallbackQuery):
     _, d = await sh("df -h -x tmpfs -x devtmpfs | head -15; echo; ss -tlnp | head -25")
-    await c.message.answer(pre(d)); await c.answer()
+    await show(c, "💾 <b>Disk / Portlar</b>\n" + pre(d), kb1(("🔄 Yangilash", "disk"), MENU_BTN)); await c.answer()
 
 
 @r.callback_query(F.data == "docker")
 async def cb_docker(c: CallbackQuery):
     _, d = await sh("docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'")
-    await c.message.answer(pre(d)); await c.answer()
+    await show(c, "🐳 <b>Docker</b>\n" + pre(d), kb1(("🔄 Yangilash", "docker"), MENU_BTN)); await c.answer()
 
 
-@r.callback_query(F.data == "svcs")
-async def cb_svcs(c: CallbackQuery):
-    _, d = await sh("systemctl list-units --type=service --state=running --no-pager --plain --no-legend | awk '{print $1}' | head -40")
-    await c.message.answer("⚙️ <b>Ishlayotgan xizmatlar</b>\n" + pre(d) +
-                           "\nBoshqarish: <code>/svc restart nginx</code>"); await c.answer()
+# ───────────── terminal ─────────────
+@r.callback_query(F.data == "term")
+async def cb_term(c: CallbackQuery):
+    INPUT[c.from_user.id] = {"kind": "sh", "back": "menu"}
+    await show(c, "🖥 <b>Terminal</b>\nBuyruq yozib yuboring (60s limit). Chiqish uchun tugmani bosing.",
+               cancel_kb("❌ Chiqish")); await c.answer()
 
 
-# ───────────── systemd ─────────────
-@r.message(Command("svc"))
-async def cmd_svc(m: Message):
-    a = (m.text or "").split()
-    if len(a) != 3 or a[1] not in {"start", "stop", "restart", "status", "enable", "disable"} or not NAME_RE.match(a[2]):
-        return await m.answer("Format: <code>/svc restart nginx</code>")
-    _, out = await sh(f"systemctl {a[1]} {a[2]} --no-pager | head -30; systemctl is-active {a[2]}")
-    await m.answer(pre(out))
-
-
-@r.message(Command("logs"))
-async def cmd_logs(m: Message):
-    a = (m.text or "").split()
-    if len(a) < 2 or not NAME_RE.match(a[1]): return await m.answer("Format: <code>/logs nom [qator]</code>")
-    n = int(a[2]) if len(a) > 2 and a[2].isdigit() else 60
-    u = unit(a[1]) if (APPS / a[1]).is_dir() else a[1]
-    _, out = await sh(f"journalctl -u {u} -n {min(n, 300)} --no-pager -o cat")
-    await m.answer(pre(out))
-
-
-@r.message(Command("sh"))
-async def cmd_sh(m: Message):
-    cmd = (m.text or "").partition(" ")[2].strip()
-    if not cmd: return await m.answer("Format: <code>/sh ls -la</code>")
-    code, out = await sh(cmd, timeout=60)
-    await m.answer(f"exit={code}\n" + pre(out))
-
-
-@r.message(Command("reboot"))
-async def cmd_reboot(m: Message):
-    b = InlineKeyboardBuilder(); b.button(text="✅ Ha, reboot", callback_data="reboot_yes"); b.button(text="Bekor", callback_data="x")
-    await m.answer("Server qayta yuklansinmi?", reply_markup=b.as_markup())
+# ───────────── reboot ─────────────
+@r.callback_query(F.data == "reboot")
+async def cb_reboot_ask(c: CallbackQuery):
+    b = InlineKeyboardBuilder(); b.button(text="✅ Ha, reboot", callback_data="reboot_yes"); b.button(text="❌ Bekor", callback_data="menu")
+    await show(c, "♻️ Server qayta yuklansinmi?", b.as_markup()); await c.answer()
 
 
 @r.callback_query(F.data == "reboot_yes")
 async def cb_reboot(c: CallbackQuery):
-    await c.message.edit_text("♻️ Reboot..."); await sh("systemctl reboot")
+    await show(c, "♻️ Reboot..."); await c.answer(); await sh("systemctl reboot")
 
 
-@r.callback_query(F.data == "x")
-async def cb_cancel(c: CallbackQuery): await c.message.delete()
+# ───────────── systemd xizmatlar ─────────────
+@r.callback_query(F.data == "svcs")
+async def cb_svcs(c: CallbackQuery):
+    _, d = await sh("systemctl list-units --type=service --state=running --no-pager --plain --no-legend | awk '{print $1}' | head -40")
+    b = InlineKeyboardBuilder()
+    for s in d.split():
+        if NAME_RE.match(s): b.button(text=s.removesuffix(".service"), callback_data=f"sv:{ref('@svc', s)}")
+    b.adjust(2)
+    b.row(Btn("🔄 Yangilash", "svcs"), Btn(*MENU_BTN))
+    await show(c, "⚙️ <b>Ishlayotgan xizmatlar</b>", b.as_markup()); await c.answer()
+
+
+@r.callback_query(F.data.startswith("sv:"))
+async def cb_sv(c: CallbackQuery):
+    x = REG.get(c.data[3:])
+    if not x: return await stale(c)
+    s, k = x[1], c.data[3:]
+    _, st = await sh(f"systemctl is-active {s}")
+    b = InlineKeyboardBuilder()
+    for t, a in [("▶️ Start", "start"), ("⏹ Stop", "stop"), ("🔄 Restart", "restart"), ("ℹ️ Status", "status"), ("📜 Log", "logs")]:
+        b.button(text=t, callback_data=f"sa:{k}:{a}")
+    b.adjust(3)
+    b.row(Btn("⬅️ Xizmatlar", "svcs"), Btn(*MENU_BTN))
+    await show(c, f"⚙️ <b>{html.escape(s)}</b> — {st.strip()}", b.as_markup()); await c.answer()
+
+
+@r.callback_query(F.data.startswith("sa:"))
+async def cb_sa(c: CallbackQuery):
+    _, k, a = c.data.split(":")
+    x = REG.get(k)
+    if not x: return await stale(c)
+    s = x[1]
+    if a == "logs": cmd = f"journalctl -u {s} -n 60 --no-pager -o cat"
+    elif a == "status": cmd = f"systemctl status {s} --no-pager | head -30"
+    else: cmd = f"systemctl {a} {s}; sleep 1; systemctl is-active {s}"
+    _, out = await sh(cmd)
+    await show(c, f"<b>{html.escape(s)}</b>: {a}\n" + pre(out), kb1(("⬅️ Orqaga", f"sv:{k}"), MENU_BTN)); await c.answer()
 
 
 # ───────────── ilovalar ─────────────
-@r.message(Command("apps"))
-async def cmd_apps(m: Message): await show_apps(m)
-
-
 @r.callback_query(F.data == "apps")
-async def cb_apps(c: CallbackQuery): await show_apps(c.message); await c.answer()
-
-
-async def show_apps(m: Message):
+async def cb_apps(c: CallbackQuery):
     names = app_names()
-    if not names: return await m.answer("Hali ilova yo'q. ZIP yuboring 📦")
     b = InlineKeyboardBuilder()
     for n in names:
         _, st = await sh(f"systemctl is-active {unit(n)}")
         b.button(text=f"{'🟢' if st.strip()=='active' else '🔴'} {n}", callback_data=f"app:{n}")
     b.adjust(2)
-    await m.answer("📦 <b>Ilovalar</b>", reply_markup=b.as_markup())
+    b.row(Btn("🔄 Yangilash", "apps"), Btn(*MENU_BTN))
+    txt = "📦 <b>Ilovalar</b> (🟢 ishlayapti · 🔴 to'xtagan)" if names else "Hali ilova yo'q. ZIP yuboring 📦"
+    await show(c, txt, b.as_markup()); await c.answer()
+
+
+async def app_info(n: str) -> str:
+    _, o = await sh(f"systemctl show {unit(n)} -p ActiveState,SubState,ActiveEnterTimestamp,MainPID,MemoryCurrent")
+    s = dict(l.split("=", 1) for l in o.splitlines() if "=" in l)
+    act = s.get("ActiveState", "?")
+    lines = [f"{'🟢' if act == 'active' else '🔴'} <b>{html.escape(n)}</b> — {act}/{s.get('SubState', '?')}"]
+    if act == "active":
+        if s.get("ActiveEnterTimestamp"): lines.append(f"Boshlangan: {s['ActiveEnterTimestamp']}")
+        if s.get("MainPID", "0") != "0": lines.append(f"PID: {s['MainPID']}")
+        if s.get("MemoryCurrent", "").isdigit(): lines.append(f"RAM: {int(s['MemoryCurrent']) / 1024**2:.0f} MB")
+    return "\n".join(lines)
+
+
+async def app_panel(c: CallbackQuery, n: str):
+    b = InlineKeyboardBuilder()
+    for t, a in [("▶️ Start", "start"), ("⏹ Stop", "stop"), ("🔄 Restart", "restart"),
+                 ("📜 Log", "logs"), ("🤖 AI fix", "fix"), ("⬆️ ZIP yangilash", "upd"),
+                 ("↩️ Oldingi versiya", "rollback"), ("🗑 O'chirish", "delete")]:
+        b.button(text=t, callback_data=f"do:{n}:{a}")
+    b.adjust(3)
+    b.row(Btn("📁 Fayllar", f"fb:{ref(n, '')}:0"))
+    b.row(Btn("⬅️ Ilovalar", "apps"), Btn(*MENU_BTN))
+    await show(c, await app_info(n), b.as_markup())
 
 
 @r.callback_query(F.data.startswith("app:"))
 async def cb_app(c: CallbackQuery):
-    n = c.data.split(":")[1]
-    b = InlineKeyboardBuilder()
-    for t, a in [("▶️ Start", "start"), ("⏹ Stop", "stop"), ("🔄 Restart", "restart"),
-                 ("📜 Log", "logs"), ("🤖 AI fix", "fix"), ("🗑 O'chirish", "delete"),
-                 ("⬆️ ZIP yangilash", "upd"), ("↩️ Oldingi versiya", "rollback")]:
-        b.button(text=t, callback_data=f"do:{n}:{a}")
-    b.adjust(3)
-    _, st = await sh(f"systemctl is-active {unit(n)}")
-    await c.message.answer(f"<b>{n}</b> — {st.strip()}", reply_markup=b.as_markup()); await c.answer()
+    n = c.data.split(":", 1)[1]
+    if not NAME_RE.match(n) or not (APPS / n).is_dir(): return await stale(c)
+    await app_panel(c, n); await c.answer()
 
 
 @r.callback_query(F.data.startswith("do:"))
 async def cb_do(c: CallbackQuery):
     _, n, a = c.data.split(":")
+    if not NAME_RE.match(n) or not (APPS / n).is_dir(): return await stale(c)
+    back = kb1(("⬅️ Ilova", f"app:{n}"), MENU_BTN)
     if a in {"start", "stop", "restart"}:
         _, out = await sh(f"systemctl {a} {unit(n)}; sleep 1; systemctl is-active {unit(n)}")
-        await c.message.answer(f"{n}: {a} → {pre(out)}")
+        await show(c, f"<b>{n}</b>: {a} → {pre(out)}", back)
     elif a == "logs":
         _, out = await sh(f"journalctl -u {unit(n)} -n 60 --no-pager -o cat")
-        await c.message.answer(pre(out))
+        await show(c, f"📜 <b>{n}</b>\n" + pre(out), kb1(("🔄 Yangilash", f"do:{n}:logs"), ("⬅️ Ilova", f"app:{n}")))
     elif a == "fix":
         await ai_fix(c.message, n)
     elif a == "upd":
-        WAITING[c.from_user.id] = n
-        await c.message.answer(f"📦 <b>{n}</b> uchun yangi ZIP faylni yuboring.")
+        INPUT[c.from_user.id] = {"kind": "zip_update", "app": n, "back": f"app:{n}"}
+        await show(c, f"📦 <b>{n}</b> uchun yangi ZIP faylni yuboring.", cancel_kb())
     elif a == "rollback":
         await do_rollback(c.message, n)
     elif a == "delete":
+        b = InlineKeyboardBuilder(); b.button(text="✅ Ha, o'chirish", callback_data=f"do:{n}:dy"); b.button(text="❌ Bekor", callback_data=f"app:{n}")
+        await show(c, f"⚠️ <b>{n}</b> ilovasi va uning barcha fayllari o'chiriladi. Davom etasizmi?", b.as_markup())
+    elif a == "dy":
         await sh(f"systemctl disable --now {unit(n)}; rm -f /etc/systemd/system/{unit(n)}; systemctl daemon-reload")
         shutil.rmtree(APPS / n, ignore_errors=True)
-        await c.message.answer(f"🗑 {n} o'chirildi")
+        await show(c, f"🗑 {n} o'chirildi", kb1(("⬅️ Ilovalar", "apps"), MENU_BTN))
     await c.answer()
+
+
+# ───────────── fayl menejeri ─────────────
+def list_dir(t: Path) -> list[Path]:
+    return sorted(t.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+
+
+def parent_back(app: str, rel: str) -> str:
+    rel = norm(rel)
+    if not rel: return f"app:{app}"
+    return f"fb:{ref(app, str(Path(rel).parent))}:0"
+
+
+def self_back(key: str, is_dir: bool) -> str:
+    return f"fb:{key}:0" if is_dir else f"ff:{key}"
+
+
+async def render_dir(c: CallbackQuery, key: str, page: int = 0):
+    x = REG.get(key)
+    if not x: return await stale(c)
+    app, rel = x
+    try:
+        root, t = resolve(app, rel)
+        if not t.is_dir(): raise ValueError("Papka topilmadi")
+        items = await asyncio.to_thread(list_dir, t)
+    except Exception as e:
+        return await show(c, f"❌ {html.escape(str(e))}", kb1(("⬅️ Ilova", f"app:{app}"), MENU_BTN))
+    pages = max(1, -(-len(items) // PAGE)); page = min(max(page, 0), pages - 1)
+    b = InlineKeyboardBuilder()
+    for p in items[page * PAGE:(page + 1) * PAGE]:
+        r2 = str(p.relative_to(root)); nm = p.name if len(p.name) <= 36 else p.name[:35] + "…"
+        if p.is_dir():
+            b.button(text=f"📁 {nm}", callback_data=f"fb:{ref(app, r2)}:0")
+        else:
+            try: sz = hsize(p.stat().st_size)
+            except OSError: sz = "?"
+            b.button(text=f"📄 {nm} · {sz}", callback_data=f"ff:{ref(app, r2)}")
+    b.adjust(1)
+    if pages > 1:
+        nav = []
+        if page > 0: nav.append(Btn("◀️", f"fb:{key}:{page - 1}"))
+        nav.append(Btn(f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1: nav.append(Btn("▶️", f"fb:{key}:{page + 1}"))
+        b.row(*nav)
+    b.row(Btn("📤 Fayl yuklash", f"fa:{key}:up"), Btn("📁 Yangi papka", f"fa:{key}:mk"))
+    if norm(rel):
+        b.row(Btn("✏️ Nomini o'zgartirish", f"fa:{key}:ren"), Btn("🗑 O'chirish", f"fa:{key}:del"))
+    b.row(Btn("⬅️ Orqaga", parent_back(app, rel)), Btn(*MENU_BTN))
+    path = html.escape(f"{app}/{norm(rel)}")
+    await show(c, f"📁 <b>{path}</b>\n{len(items)} ta element", b.as_markup())
+
+
+@r.callback_query(F.data.startswith("fb:"))
+async def cb_fb(c: CallbackQuery):
+    _, key, page = c.data.split(":")
+    await render_dir(c, key, int(page)); await c.answer()
+
+
+@r.callback_query(F.data.startswith("ff:"))
+async def cb_ff(c: CallbackQuery):
+    key = c.data[3:]
+    x = REG.get(key)
+    if not x: return await stale(c)
+    app, rel = x
+    try:
+        root, t = resolve(app, rel)
+        s = t.stat()
+        if not t.is_file(): raise ValueError("Fayl topilmadi")
+    except Exception as e:
+        return await show(c, f"❌ {html.escape(str(e))}", kb1(("⬅️ Ilova", f"app:{app}"), MENU_BTN))
+    b = InlineKeyboardBuilder()
+    for tx, a in [("👁 Ko'rish", "view"), ("📥 Yuklab olish", "dl"), ("✏️ Nomini o'zgartirish", "ren"),
+                  ("🔄 Almashtirish", "rep"), ("🗑 O'chirish", "del")]:
+        b.button(text=tx, callback_data=f"fa:{key}:{a}")
+    b.adjust(2)
+    b.row(Btn("⬅️ Orqaga", parent_back(app, rel)), Btn(*MENU_BTN))
+    await show(c, f"📄 <b>{html.escape(t.name)}</b>\n<code>{html.escape(app + '/' + rel)}</code>\n"
+                  f"Hajmi: {hsize(s.st_size)}\nO'zgargan: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s.st_mtime))}",
+               b.as_markup())
+    await c.answer()
+
+
+@r.callback_query(F.data.startswith("fa:"))
+async def cb_fa(c: CallbackQuery):
+    _, key, act = c.data.split(":")
+    x = REG.get(key)
+    if not x: return await stale(c)
+    app, rel = x
+    uid = c.from_user.id
+    try:
+        root, t = resolve(app, rel)
+        if not t.exists(): raise ValueError("Topilmadi (o'chirilgan yoki ko'chirilgan)")
+    except Exception as e:
+        return await show(c, f"❌ {html.escape(str(e))}", kb1(("⬅️ Ilova", f"app:{app}"), MENU_BTN))
+    isd = t.is_dir(); back = self_back(key, isd)
+    if act == "view":
+        if isd: return await c.answer()
+        if t.stat().st_size > 200_000:
+            txt = "Fayl katta (>200KB). 📥 Yuklab olish tugmasidan foydalaning."
+        else:
+            data = await asyncio.to_thread(t.read_bytes)
+            txt = "Matn emas (binary). 📥 Yuklab oling." if b"\0" in data else pre_head(data.decode(errors="replace"))
+        await show(c, f"👁 <b>{html.escape(t.name)}</b>\n{txt}", kb1(("⬅️ Orqaga", back), MENU_BTN))
+    elif act == "dl":
+        if isd: return await c.answer()
+        if t.stat().st_size > 49 * 1024 * 1024:
+            return await c.answer("Fayl 50MB dan katta, Telegram yubora olmaydi", show_alert=True)
+        await c.message.answer_document(FSInputFile(t))
+    elif act == "ren":
+        if t == root: return await c.answer("Ilova papkasini bu yerda o'zgartirib bo'lmaydi", show_alert=True)
+        INPUT[uid] = {"kind": "ren", "key": key, "back": back}
+        await show(c, f"✏️ <b>{html.escape(t.name)}</b> uchun yangi nomni yozing:", cancel_kb())
+    elif act == "rep":
+        if isd: return await c.answer()
+        INPUT[uid] = {"kind": "rep", "key": key, "back": back}
+        await show(c, f"🔄 <b>{html.escape(t.name)}</b> o'rniga yangi faylni yuboring.\nNomi saqlanadi, mazmuni almashtiriladi.", cancel_kb())
+    elif act == "up":
+        if not isd: return await c.answer()
+        INPUT[uid] = {"kind": "up", "key": key, "back": back}
+        await show(c, f"📤 <b>{html.escape(app + '/' + rel)}</b> papkasiga yuklanadigan faylni yuboring.\n(ZIP bo'lsa ham deploy qilinmaydi, oddiy fayl sifatida saqlanadi.)", cancel_kb())
+    elif act == "mk":
+        if not isd: return await c.answer()
+        INPUT[uid] = {"kind": "mkdir", "key": key, "back": back}
+        await show(c, "📁 Yangi papka nomini yozing:", cancel_kb())
+    elif act == "del":
+        if t == root: return await c.answer("Ilovani 📦 Ilovalar bo'limidan o'chiring", show_alert=True)
+        b = InlineKeyboardBuilder(); b.button(text="✅ Ha, o'chirish", callback_data=f"fa:{key}:dy"); b.button(text="❌ Bekor", callback_data=back)
+        await show(c, f"⚠️ {'Papka (ichidagilari bilan)' if isd else 'Fayl'} <b>{html.escape(t.name)}</b> o'chirilsinmi?", b.as_markup())
+    elif act == "dy":
+        if t == root: return await c.answer()
+        if isd and not t.is_symlink(): await asyncio.to_thread(shutil.rmtree, t, True)
+        else: t.unlink(missing_ok=True)
+        await show(c, f"🗑 <b>{html.escape(t.name)}</b> o'chirildi", kb1(("⬅️ Papkaga", parent_back(app, rel)), MENU_BTN))
+    await c.answer()
+
+
+BAD_NAME = re.compile(r"[\\/\x00]")
+
+
+def valid_name(s: str) -> bool:
+    return 0 < len(s) <= 100 and s not in (".", "..") and not BAD_NAME.search(s)
+
+
+async def file_receive(m: Message, st: dict):
+    """'rep' (fayl almashtirish) yoki 'up' (papkaga yuklash)."""
+    INPUT.pop(m.from_user.id, None)
+    x = REG.get(st["key"]); doc = m.document
+    if not x: return await m.answer("Tugma eskirgan, qaytadan oching.", reply_markup=main_kb())
+    app, rel = x
+    tmp = TMP / uuid.uuid4().hex
+    try:
+        if doc.file_size and doc.file_size > MAX_UP:
+            raise ValueError("Telegram Bot API 20MB dan katta faylni bermaydi")
+        root, t = resolve(app, rel)
+        if st["kind"] == "rep":
+            if not t.is_file(): raise ValueError("Almashtiriladigan fayl topilmadi")
+            dest = t
+        else:
+            if not t.is_dir(): raise ValueError("Papka topilmadi")
+            name = BAD_NAME.sub("_", Path(doc.file_name or "file").name).strip() or "file"
+            if name in (".", ".."): name = "file"
+            dest = t / name
+            if dest.is_dir(): raise ValueError("Shu nomli papka mavjud")
+        await bot.download(doc, destination=tmp)
+        existed = dest.exists(); mode = dest.stat().st_mode & 0o7777 if existed else None
+        await asyncio.to_thread(shutil.move, str(tmp), str(dest))
+        if mode is not None: os.chmod(dest, mode)
+        nrel = str(dest.relative_to(root))
+        b = InlineKeyboardBuilder()
+        b.button(text=f"🔄 Restart {app}", callback_data=f"do:{app}:restart")
+        b.button(text="📄 Fayl", callback_data=f"ff:{ref(app, nrel)}")
+        b.button(text="📁 Papka", callback_data=parent_back(app, nrel))
+        b.adjust(1)
+        what = "almashtirildi" if existed else "yuklandi"
+        await m.answer(f"✅ <b>{html.escape(dest.name)}</b> {what} ({hsize(dest.stat().st_size)})", reply_markup=b.as_markup())
+    except Exception as e:
+        await m.answer(f"❌ Xato: {html.escape(str(e))}", reply_markup=kb1(("⬅️ Orqaga", st["back"]), MENU_BTN))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@r.message(F.text)
+async def on_text(m: Message):
+    uid = m.from_user.id; st = INPUT.get(uid)
+    if not st or st["kind"] not in {"sh", "ren", "mkdir"}:
+        return await m.answer(MENU_TEXT, reply_markup=main_kb())
+    if st["kind"] == "sh":
+        code, out = await sh((m.text or "").strip(), timeout=60)
+        return await m.answer(f"exit={code}\n" + pre(out) + "\n🖥 Yana buyruq yozing.", reply_markup=cancel_kb("❌ Chiqish"))
+    x = REG.get(st["key"])
+    if not x:
+        INPUT.pop(uid, None)
+        return await m.answer("Tugma eskirgan, qaytadan oching.", reply_markup=main_kb())
+    app, rel = x
+    name = (m.text or "").strip()
+    if not valid_name(name):
+        return await m.answer("⚠️ Nom noto'g'ri (/ \\ belgilarsiz, 100 belgigacha). Qayta yozing:", reply_markup=cancel_kb())
+    try:
+        root, t = resolve(app, rel)
+        dest = (t / name) if st["kind"] == "mkdir" else t.with_name(name)
+        if dest.exists():
+            return await m.answer("⚠️ Bunday nom allaqachon bor. Boshqa nom yozing:", reply_markup=cancel_kb())
+        if st["kind"] == "mkdir": dest.mkdir()
+        else:
+            if t == root: raise ValueError("Ilova papkasini bu yerda o'zgartirib bo'lmaydi")
+            t.rename(dest)
+        INPUT.pop(uid, None)
+        nrel = str(dest.relative_to(root))
+        b = InlineKeyboardBuilder()
+        b.button(text="📁 Ochish" if dest.is_dir() else "📄 Ochish", callback_data=self_back(ref(app, nrel), dest.is_dir()))
+        b.button(text="⬅️ Papkaga", callback_data=parent_back(app, nrel))
+        b.button(text=f"🔄 Restart {app}", callback_data=f"do:{app}:restart")
+        b.adjust(2)
+        await m.answer(f"✅ {'Papka yaratildi' if st['kind'] == 'mkdir' else 'Nom o`zgartirildi'}: <b>{html.escape(name)}</b>", reply_markup=b.as_markup())
+    except Exception as e:
+        INPUT.pop(uid, None)
+        await m.answer(f"❌ Xato: {html.escape(str(e))}", reply_markup=kb1(("⬅️ Orqaga", st["back"]), MENU_BTN))
 
 
 # ───────────── ZIP deploy ─────────────
@@ -322,16 +649,19 @@ def detect(d: Path) -> tuple[str, str, str]:
 @r.message(F.document)
 async def on_zip(m: Message):
     doc = m.document
+    st = INPUT.get(m.from_user.id)
+    if st and st["kind"] in {"rep", "up"}:
+        return await file_receive(m, st)
     if not (doc.file_name or "").lower().endswith(".zip"):
-        return await m.answer("Faqat .zip fayl qabul qilinadi.")
+        return await m.answer("Faqat .zip fayl qabul qilinadi. Fayl almashtirish uchun 📦 Ilovalar → 📁 Fayllar bo'limidan foydalaning.",
+                              reply_markup=main_kb())
     if doc.file_size and doc.file_size > 20 * 1024 * 1024:
         return await m.answer("⚠️ Telegram Bot API 20MB dan katta faylni bermaydi. Kichraytiring yoki local Bot API server ishlating.")
     name = re.sub(r"[^a-zA-Z0-9_.-]", "-", Path(doc.file_name).stem)[:50]
-    cap = (m.caption or "").split()
-    target = WAITING.pop(m.from_user.id, None)
-    if len(cap) == 2 and cap[0] == "/update" and NAME_RE.match(cap[1]):
-        target = cap[1]
-    elif not target and (APPS / name).is_dir():
+    target = None
+    if st and st["kind"] == "zip_update":
+        target = st["app"]; INPUT.pop(m.from_user.id, None)
+    elif (APPS / name).is_dir():
         target = name  # shu nomli ilova bor — yangilash rejimi (rollback himoyasi bilan)
     if target and not (APPS / target).is_dir():
         return await m.answer("Bunday ilova yo'q.")
@@ -375,6 +705,7 @@ async def on_zip(m: Message):
         ok = st.strip() == "active"
         b = InlineKeyboardBuilder()
         b.button(text="📜 Log", callback_data=f"do:{name}:logs")
+        b.button(text="📦 Ilova", callback_data=f"app:{name}")
         if not ok: b.button(text="🤖 AI fix", callback_data=f"do:{name}:fix")
         await msg.edit_text(f"{'✅ Ishlayapti' if ok else '❌ Ishga tushmadi'}: <b>{name}</b>\n"
                             f"<code>{html.escape(run)}</code>\n{pre(lg)}", reply_markup=b.as_markup())
@@ -385,7 +716,6 @@ async def on_zip(m: Message):
 
 
 # ───────────── ZIP bilan yangilash + rollback ─────────────
-WAITING: dict[int, str] = {}  # user_id -> ilova (keyingi ZIP shu ilovani yangilaydi)
 KEEP = {".venv", "venv", "node_modules", ".env", "data", "uploads"}  # yangilashda tegilmaydi
 DBSUF = {".db", ".sqlite", ".sqlite3"}
 
@@ -599,24 +929,6 @@ async def do_rollback(m: Message, name: str):
     await msg.edit_text(f"{'✅ Qaytarildi' if ok else '❌ Ishlamadi: ' + html.escape(why)} — {time.time()-t0:.1f}s\n{pre(lg, 1800)}")
 
 
-@r.message(Command("update"))
-async def cmd_update(m: Message):
-    a = (m.text or "").split()
-    if len(a) != 2 or not NAME_RE.match(a[1]) or not (APPS / a[1]).is_dir():
-        return await m.answer("Format: <code>/update nom</code> (nom — /apps dagi ilova)")
-    WAITING[m.from_user.id] = a[1]
-    await m.answer(f"📦 <b>{a[1]}</b> uchun yangi ZIP faylni yuboring.")
-
-
-@r.message(Command("rollback"))
-async def cmd_rollback(m: Message):
-    a = (m.text or "").split()
-    if len(a) != 2 or not NAME_RE.match(a[1]) or not (APPS / a[1]).is_dir():
-        return await m.answer("Format: <code>/rollback nom</code>")
-    await do_rollback(m, a[1])
-
-
-# ───────────── AI tuzatish ─────────────
 SKIP = {".venv", "node_modules", ".git", "__pycache__", "venv"}
 
 
@@ -660,13 +972,6 @@ async def ai_fix(m: Message, name: str):
     await msg.edit_text(f"🤖 <b>Tahlil</b>\n{html.escape(data.get('explanation',''))}\n\n"
                         f"Fayllar: <code>{html.escape(files)}</code>\nPaketlar: {data.get('pip') or data.get('npm') or '—'}",
                         reply_markup=b.as_markup())
-
-
-@r.message(Command("fix"))
-async def cmd_fix(m: Message):
-    a = (m.text or "").split()
-    if len(a) != 2 or not NAME_RE.match(a[1]): return await m.answer("Format: <code>/fix nom</code>")
-    await ai_fix(m, a[1])
 
 
 @r.callback_query(F.data.startswith("ai:"))
